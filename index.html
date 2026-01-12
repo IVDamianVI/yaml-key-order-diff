@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description"
+          content="Visual tool for comparing YAML files by key order. Detects missing, moved, and reordered keys, ideal for i18n and locale files.">
+    <meta name="author" content="Damian Grubecki">
+    <meta name="robots" content="noindex, nofollow">
+    <title>YAML Key Order Diff</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --panel: #020617;
+            --border: #1e293b;
+            --text: #e5e7eb;
+            --muted: #94a3b8;
+            --accent: #38bdf8;
+            --danger-bg: #3f1d1d;
+            --danger-text: #fecaca;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #020617;
+            color: var(--text);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 20px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        .panel {
+            display: flex;
+            flex-direction: column;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+        }
+
+        .panel-header {
+            padding: 10px 14px;
+            background: rgba(255, 255, 255, 0.02);
+            border-bottom: 1px solid var(--border);
+            font-size: 13px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        textarea {
+            flex: 1;
+            background: transparent;
+            border: none;
+            resize: vertical;
+            padding: 14px;
+            color: var(--text);
+            font-size: 14px;
+            line-height: 1.5;
+            outline: none;
+            white-space: pre;
+            overflow-x: auto;
+            overflow-y: auto;
+            word-break: normal;
+            word-wrap: normal;
+        }
+
+        textarea::placeholder {
+            color: var(--muted);
+        }
+
+        .result {
+            flex: 1;
+            padding: 14px;
+            font-size: 14px;
+            line-height: 1.5;
+            overflow: auto;
+            white-space: pre;
+        }
+
+        .missing,
+        .same,
+        .moved {
+            display: block;
+            border-left: 2px solid;
+        }
+
+        .missing {
+            background: var(--danger-bg);
+            color: var(--danger-text);
+            border-color: #ef4444;
+        }
+
+        .same {
+            background: rgba(251, 146, 60, 0.15);
+            color: #fed7aa;
+            border-color: #fb923c;
+        }
+
+        .moved {
+            background: rgba(56, 189, 248, 0.15);
+            color: #bae6fd;
+            border-color: #38bdf8;
+        }
+
+        textarea::-webkit-scrollbar,
+        .result::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        textarea::-webkit-scrollbar-thumb,
+        .result::-webkit-scrollbar-thumb {
+            background: #334155;
+            border-radius: 4px;
+        }
+
+        textarea::-webkit-scrollbar-track,
+        .result::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        @media (max-width: 1100px) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<div class="layout">
+    <div class="panel">
+        <div class="panel-header">Source</div>
+        <textarea id="source" placeholder="Paste source YAML file here"></textarea>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">Target</div>
+        <textarea id="target" placeholder="Paste target YAML file here"></textarea>
+    </div>
+
+    <div class="panel">
+        <div class="panel-header">
+            Result — <strong><span id="diffCount">0</span> differences</strong>
+        </div>
+        <div class="result" id="result"></div>
+    </div>
+</div>
+
+<script>
+    const INDENT_SIZE = 2;
+    const INDENT = ' '.repeat(INDENT_SIZE);
+
+    const escapeHtml = str =>
+        str
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+
+    const parseTargetMap = text => {
+        const map = {};
+        const order = [];
+
+        text.split('\n').forEach(line => {
+            const match = line.match(/^(\s*)([^:#\s]+)(\s*:\s*)(.*)$/);
+            if (match) {
+                const key = match[2];
+                map[key] = {
+                    separator: match[3],
+                    value: match[4]
+                };
+                order.push(key);
+            }
+        });
+
+        return {map, order};
+    };
+
+    const renderDiff = () => {
+        const sourceLines = document.getElementById('source').value.split('\n');
+        const targetText = document.getElementById('target').value;
+
+        const {map: targetMap, order: targetOrder} = parseTargetMap(targetText);
+        const targetLines = targetText.split('\n');
+
+        let output = '';
+
+        let sourceLineIndex = 0;
+        let sourceKeyOrderIndex = 0;
+
+        sourceLines.forEach(line => {
+            const sourceMatch = line.match(/^(\s*)([^:#\s]+)(\s*:\s*)(.*)$/);
+
+            if (sourceMatch) {
+                const indent = sourceMatch[1];
+                const key = sourceMatch[2];
+                const sourceValueRaw = sourceMatch[4];
+                const targetEntry = targetMap[key];
+
+                if (undefined !== targetEntry) {
+                    const isMoved = targetOrder[sourceKeyOrderIndex] !== key;
+                    const isSame = sourceValueRaw === targetEntry.value;
+
+                    const renderedLine =
+                        `${indent}${key}${targetEntry.separator}${escapeHtml(targetEntry.value)}`;
+
+                    if (true === isMoved) {
+                        output += `<span class="moved">${renderedLine}</span>`;
+                    } else if (true === isSame && 0 !== sourceValueRaw.length) {
+                        output += `<span class="same">${renderedLine}</span>`;
+                    } else {
+                        output += renderedLine + '\n';
+                    }
+                } else {
+                    output += `<span class="missing">${indent}${key}: TODO</span>`;
+                }
+
+                sourceKeyOrderIndex++;
+            } else {
+                const sourceLine = line;
+                const targetLine = targetLines[sourceLineIndex] ?? '';
+
+                const isSourceEmpty = '' === sourceLine.trim();
+                const isTargetEmpty = '' === targetLine.trim();
+
+                if (true === isSourceEmpty && false === isTargetEmpty) {
+                    output += `<span class="missing">(empty line)</span>`;
+                } else {
+                    output += escapeHtml(sourceLine) + '\n';
+                }
+            }
+
+            sourceLineIndex++;
+        });
+
+        const resultEl = document.getElementById('result');
+        resultEl.innerHTML = output;
+
+        const missingCount = resultEl.querySelectorAll('.missing').length;
+        const movedCount = resultEl.querySelectorAll('.moved').length;
+
+        document.getElementById('diffCount').textContent = missingCount + movedCount;
+    };
+
+    const handleTab = e => {
+        if ('Tab' !== e.key) {
+            return;
+        }
+
+        e.preventDefault();
+
+        const el = e.target;
+        const start = el.selectionStart;
+        const end = el.selectionEnd;
+        const value = el.value;
+
+        const lineStart = value.lastIndexOf('\n', start - 1) + 1;
+        const lineEnd = value.indexOf('\n', end);
+        const safeLineEnd = -1 === lineEnd ? value.length : lineEnd;
+
+        const selected = value.slice(lineStart, safeLineEnd);
+        const lines = selected.split('\n');
+
+        if (true === e.shiftKey) {
+            let removedPerLine = 0;
+
+            const newLines = lines.map(line => {
+                if (line.startsWith(INDENT)) {
+                    removedPerLine = INDENT_SIZE;
+                    return line.slice(INDENT_SIZE);
+                }
+                if (line.startsWith(' ')) {
+                    removedPerLine = 1;
+                    return line.slice(1);
+                }
+                return line;
+            });
+
+            el.value =
+                value.slice(0, lineStart) +
+                newLines.join('\n') +
+                value.slice(safeLineEnd);
+
+            el.selectionStart = Math.max(start - removedPerLine, lineStart);
+            el.selectionEnd = Math.max(
+                end - removedPerLine * lines.length,
+                el.selectionStart
+            );
+        } else {
+            const newLines = lines.map(line => INDENT + line);
+
+            el.value =
+                value.slice(0, lineStart) +
+                newLines.join('\n') +
+                value.slice(safeLineEnd);
+
+            el.selectionStart = start + INDENT_SIZE;
+            el.selectionEnd = end + INDENT_SIZE * lines.length;
+        }
+
+        el.dispatchEvent(new Event('input'));
+    };
+
+    document.getElementById('source').addEventListener('input', renderDiff);
+    document.getElementById('target').addEventListener('input', renderDiff);
+
+    document.querySelectorAll('textarea').forEach(textarea => {
+        textarea.addEventListener('keydown', handleTab);
+    });
+</script>
+
+</body>
+</html>
