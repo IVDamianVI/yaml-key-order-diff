@@ -11,10 +11,13 @@ No backend. No dependencies. Just paste and compare.
 
 ## Features
 
-- Detects **missing keys**
-- Highlights **moved / reordered keys**
-- Marks **unchanged values** with different ordering
-- Preserves indentation and formatting
+- Detects **missing and extra keys**, including nested mapping paths
+- Highlights **reordered keys and mismatched indentation**
+- Marks **identical leaf values** as warnings; different values are allowed
+- Preserves Target indentation in Result so formatting errors remain visible
+- Previous / next buttons cycle through structural differences and warnings
+- Source, Target and Result scroll together vertically and horizontally, including difference navigation
+- Separate difference and warning counters; hover a highlighted row for details
 - Visual, side-by-side comparison
 - Works entirely in the browser
 
@@ -34,9 +37,9 @@ No backend. No dependencies. Just paste and compare.
 1. Paste the reference YAML file into **Source**
 2. Paste the file to compare into **Target**
 3. The tool highlights:
-   - missing keys
-   - keys moved to a different position
-   - unchanged values with different ordering
+   - missing or extra keys
+   - reordered keys and different indentation
+   - identical values (warnings, including empty leaf values)
 
 The result panel shows a visual diff focused on structure rather than raw text differences.
 
@@ -44,9 +47,11 @@ The result panel shows a visual diff focused on structure rather than raw text d
 
 ## Limitations
 
-- Intended for **simple, flat YAML structures**
-- Does not fully parse YAML (anchors, complex nesting, multiline values)
-- Keys must follow the `key: value` pattern
+- Supports block-style mappings, nested keys, quoted keys and literal/folded block values
+- Does not fully parse YAML: sequences, flow collections, anchors, aliases and complex keys are not structurally interpreted
+- Values are compared as text (ignoring surrounding whitespace and inline comments for single-line values), without YAML type or quote normalization
+- Blank lines and standalone comments are compared as non-key lines; final line endings are normalized
+- Result follows Source key order and appends extra Target keys; structural errors take visual priority over identical-value warnings
 - Not a replacement for full YAML parsers or validators
 
 This is a **structural diff helper**, not a YAML linter.
@@ -62,6 +67,8 @@ You can:
 - embed it into internal tooling
 
 No build step required.
+
+Run comparison regression tests with `node --test comparison.test.cjs`.
 
 ---
 

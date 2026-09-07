@@ -41,6 +41,7 @@
         }
 
         .panel {
+            min-width: 0;
             display: flex;
             flex-direction: column;
             background: var(--panel);
@@ -67,6 +68,7 @@
             resize: vertical;
             padding: 14px;
             color: var(--text);
+            font-family: inherit;
             font-size: 14px;
             line-height: 1.5;
             outline: none;
@@ -90,9 +92,32 @@
             white-space: pre;
         }
 
+        .result-header, .diff-navigation {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .result-header { flex-wrap: wrap; }
+        .diff-navigation { margin-left: auto; }
+        .diff-navigation button {
+            padding: 2px 7px;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg);
+            color: var(--text);
+            cursor: pointer;
+        }
+        .diff-navigation button:disabled { opacity: 0.35; cursor: default; }
+        .diff-navigation button:focus-visible { outline: 2px solid var(--accent); }
+        .result { max-height: 75vh; min-height: 200px; }
+        .result-line { display: block; min-height: 1.5em; }
+        .result-line.active { outline: 2px solid var(--accent); outline-offset: -2px; }
+        .result-line:focus-visible { outline: 2px solid var(--accent); }
+        .warning-count { color: #fed7aa; }
+
         .missing,
-        .same,
-        .moved {
+        .same {
             display: block;
             border-left: 2px solid;
         }
@@ -107,12 +132,6 @@
             background: rgba(251, 146, 60, 0.15);
             color: #fed7aa;
             border-color: #fb923c;
-        }
-
-        .moved {
-            background: rgba(56, 189, 248, 0.15);
-            color: #bae6fd;
-            border-color: #38bdf8;
         }
 
         textarea::-webkit-scrollbar,
@@ -152,10 +171,16 @@
     </div>
 
     <div class="panel">
-        <div class="panel-header">
-            Result — <strong><span id="diffCount">0</span> differences</strong>
+        <div class="panel-header result-header">
+            <span>Result — <strong><span id="diffCount">0</span> differences</strong>
+                · <span class="warning-count"><span id="warningCount">0</span> warnings</span></span>
+            <nav class="diff-navigation" aria-label="Differences and warnings">
+                <span id="diffPosition" aria-live="polite">0 / 0</span>
+                <button id="previousDiff" type="button" aria-label="Previous difference or warning" title="Previous difference or warning" disabled>↑</button>
+                <button id="nextDiff" type="button" aria-label="Next difference or warning" title="Next difference or warning" disabled>↓</button>
+            </nav>
         </div>
-        <div class="result" id="result"></div>
+        <div class="result" id="result" role="region" aria-label="Comparison result"></div>
     </div>
 </div>
 
@@ -171,90 +196,190 @@
             .replace(/"/g, '&quot;')
             .replace(/'/g, '&#39;');
 
-    const parseTargetMap = text => {
-        const map = {};
-        const order = [];
+    // Compare block-style YAML without discarding paths, indentation or duplicate keys.
+    const parseEntries = text => {
+        const lines = text.replace(/\r\n?/g, '\n').split('\n');
+        if (lines.at(-1) === '') lines.pop();
+        const entries = [];
+        const parents = [];
+        const occurrences = new Map();
+        let block = null;
 
-        text.split('\n').forEach(line => {
-            const match = line.match(/^(\s*)([^:#\s]+)(\s*:\s*)(.*)$/);
-            if (match) {
-                const key = match[2];
-                map[key] = {
-                    separator: match[3],
-                    value: match[4]
-                };
-                order.push(key);
+        lines.forEach((line, index) => {
+            const indent = line.match(/^[ \t]*/)[0];
+            if (block && (line.trim() === '' || indent.length > block.indent.length)) {
+                block.raw += '\n' + line;
+                block.value += '\n' + line.slice(block.indent.length);
+                block.blockIndents.push(line.trim() === '' ? '' : indent);
+                return;
+            }
+            block = null;
+            const match = line.match(/^([ \t]*)("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s:#][^:]*?):(?:[ \t]+(.*)|$)/);
+            if (!match) {
+                entries.push({raw: line, position: entries.length, kind: 'literal'});
+                return;
+            }
+            while (parents.length && parents.at(-1).indent.length >= indent.length) parents.pop();
+            const key = match[2].trim();
+            const parent = parents.at(-1)?.id ?? '';
+            const parentPath = parents.at(-1)?.path ?? [];
+            const occurrenceKey = JSON.stringify([...parentPath, key]);
+            const occurrence = occurrences.get(occurrenceKey) ?? 0;
+            occurrences.set(occurrenceKey, occurrence + 1);
+            const path = [...parentPath, [key, occurrence]];
+            const value = match[3] ?? '';
+            const entry = {
+                id: JSON.stringify(path), path, parent, key, indent, value,
+                raw: line, line: index + 1, kind: 'key', container: false, blockIndents: []
+            };
+            if (parents.length) parents.at(-1).container = true;
+            entries.push(entry);
+            parents.push(entry);
+            if (/^[|>](?:[1-9][+-]?|[+-][1-9]?)?(?:\s+#.*)?\s*$/.test(value)) block = entry;
+        });
+        return entries;
+    };
+
+    const comparableValue = entry => {
+        if (entry.blockIndents.length) return entry.value;
+        // A comment starts at an unquoted # preceded by whitespace.
+        let quote = null;
+        for (let index = 0; index < entry.value.length; index++) {
+            const char = entry.value[index];
+            if (quote === '"' && char === '\\') { index++; continue; }
+            if (quote === "'" && char === "'" && entry.value[index + 1] === "'") { index++; continue; }
+            if (quote) {
+                if (char === quote) quote = null;
+            } else if (char === '"' || char === "'") {
+                quote = char;
+            } else if (char === '#' && (index === 0 || /\s/.test(entry.value[index - 1]))) {
+                return entry.value.slice(0, index).trim();
+            }
+        }
+        return entry.value.trim();
+    };
+
+    const compareYaml = (sourceText, targetText) => {
+        const source = parseEntries(sourceText);
+        const target = parseEntries(targetText);
+        const sourceMap = new Map(source.filter(entry => entry.kind === 'key').map(entry => [entry.id, entry]));
+        const targetMap = new Map(target.filter(entry => entry.kind === 'key').map(entry => [entry.id, entry]));
+        // Compare sibling order only among shared keys: one missing key must not move every later key.
+        const sharedOrder = (entries, other) => {
+            const groups = new Map();
+            const ranks = new Map();
+            entries.filter(entry => entry.kind === 'key' && other.has(entry.id)).forEach(entry => {
+                const rank = groups.get(entry.parent) ?? 0;
+                ranks.set(entry.id, rank);
+                groups.set(entry.parent, rank + 1);
+            });
+            return ranks;
+        };
+        const sourceOrder = sharedOrder(source, targetMap);
+        const targetOrder = sharedOrder(target, sourceMap);
+        const targetLiterals = target.filter(entry => entry.kind === 'literal');
+        let literalIndex = 0;
+        const rows = source.map(entry => {
+            if (entry.kind === 'literal') {
+                const other = targetLiterals[literalIndex++];
+                const same = other?.raw === entry.raw && other?.position === entry.position;
+                return {text: other?.raw ?? entry.raw, issues: same ? [] : ['Non-key line differs'], warning: false};
+            }
+            const other = targetMap.get(entry.id);
+            if (!other) return {text: entry.raw, issues: ['Missing key in Target'], warning: false};
+            const issues = [];
+            if (entry.indent !== other.indent) issues.push('Indentation differs');
+            if (sourceOrder.get(entry.id) !== targetOrder.get(entry.id)) issues.push('Key order differs');
+            if (entry.container !== other.container) issues.push('Mapping / value structure differs');
+            if (entry.blockIndents.length && other.blockIndents.length &&
+                entry.blockIndents.find(value => value !== '') !== other.blockIndents.find(value => value !== '')) {
+                issues.push('Multiline value indentation differs');
+            }
+            const warning = !entry.container && !other.container && comparableValue(entry) === comparableValue(other);
+            return {text: other.raw, issues, warning, sourceLine: entry.line, targetLine: other.line};
+        });
+        target.forEach(entry => {
+            if (entry.kind === 'key' && !sourceMap.has(entry.id)) {
+                rows.push({text: entry.raw, issues: ['Extra key in Target'], warning: false});
             }
         });
+        targetLiterals.slice(literalIndex).forEach(entry => {
+            rows.push({text: entry.raw, issues: ['Extra non-key line in Target'], warning: false});
+        });
+        return rows;
+    };
 
-        return {map, order};
+    const scrollPanels = ['source', 'target', 'result'].map(id => document.getElementById(id));
+    const scrollPositions = new WeakMap(scrollPanels.map(panel => [panel, {
+        top: panel.scrollTop,
+        left: panel.scrollLeft
+    }]));
+
+    const synchronizeScroll = origin => {
+        const previous = scrollPositions.get(origin);
+        const top = origin.scrollTop;
+        const left = origin.scrollLeft;
+        const verticalChanged = top !== previous.top;
+        const horizontalChanged = left !== previous.left;
+        scrollPositions.set(origin, {top, left});
+        if (!verticalChanged && !horizontalChanged) return;
+
+        scrollPanels.forEach(panel => {
+            if (panel === origin) return;
+            if (verticalChanged) panel.scrollTop = top;
+            if (horizontalChanged) panel.scrollLeft = left;
+            // Store the actual (possibly clamped) position so queued scroll events
+            // from shorter panels cannot pull the other panels back.
+            scrollPositions.set(panel, {top: panel.scrollTop, left: panel.scrollLeft});
+        });
+    };
+
+    scrollPanels.forEach(panel => {
+        panel.addEventListener('scroll', () => synchronizeScroll(panel), {passive: true});
+    });
+
+    let differenceElements = [];
+    let activeDifference = -1;
+
+    const updateNavigation = () => {
+        document.getElementById('diffPosition').textContent = `${activeDifference + 1} / ${differenceElements.length}`;
+        document.getElementById('previousDiff').disabled = differenceElements.length === 0;
+        document.getElementById('nextDiff').disabled = differenceElements.length === 0;
+    };
+
+    const navigateDifference = direction => {
+        if (!differenceElements.length) return;
+        differenceElements[activeDifference]?.classList.remove('active');
+        activeDifference = activeDifference === -1
+            ? (direction > 0 ? 0 : differenceElements.length - 1)
+            : (activeDifference + direction + differenceElements.length) % differenceElements.length;
+        const element = differenceElements[activeDifference];
+        element.classList.add('active');
+        element.scrollIntoView({block: 'nearest', inline: 'nearest'});
+        synchronizeScroll(document.getElementById('result'));
+        element.focus({preventScroll: true});
+        updateNavigation();
     };
 
     const renderDiff = () => {
-        const sourceLines = document.getElementById('source').value.split('\n');
-        const targetText = document.getElementById('target').value;
-
-        const {map: targetMap, order: targetOrder} = parseTargetMap(targetText);
-        const targetLines = targetText.split('\n');
-
-        let output = '';
-
-        let sourceLineIndex = 0;
-        let sourceKeyOrderIndex = 0;
-
-        sourceLines.forEach(line => {
-            const sourceMatch = line.match(/^(\s*)([^:#\s]+)(\s*:\s*)(.*)$/);
-
-            if (sourceMatch) {
-                const indent = sourceMatch[1];
-                const key = sourceMatch[2];
-                const sourceValueRaw = sourceMatch[4];
-                const targetEntry = targetMap[key];
-
-                if (undefined !== targetEntry) {
-                    const isMoved = targetOrder[sourceKeyOrderIndex] !== key;
-                    const isSame = sourceValueRaw === targetEntry.value;
-
-                    const renderedLine =
-                        `${indent}${key}${targetEntry.separator}${escapeHtml(targetEntry.value)}`;
-
-                    if (true === isMoved) {
-                        output += `<span class="moved">${renderedLine}</span>`;
-                    } else if (true === isSame && 0 !== sourceValueRaw.length) {
-                        output += `<span class="same">${renderedLine}</span>`;
-                    } else {
-                        output += renderedLine + '\n';
-                    }
-                } else {
-                    output += `<span class="missing">${indent}${key}: TODO</span>`;
-                }
-
-                sourceKeyOrderIndex++;
-            } else {
-                const sourceLine = line;
-                const targetLine = targetLines[sourceLineIndex] ?? '';
-
-                const isSourceEmpty = '' === sourceLine.trim();
-                const isTargetEmpty = '' === targetLine.trim();
-
-                if (true === isSourceEmpty && false === isTargetEmpty) {
-                    output += `<span class="missing">(empty line)</span>`;
-                } else {
-                    output += escapeHtml(sourceLine) + '\n';
-                }
-            }
-
-            sourceLineIndex++;
-        });
-
-        const resultEl = document.getElementById('result');
-        resultEl.innerHTML = output;
-
-        const missingCount = resultEl.querySelectorAll('.missing').length;
-        const movedCount = resultEl.querySelectorAll('.moved').length;
-
-        document.getElementById('diffCount').textContent = missingCount + movedCount;
+        const rows = compareYaml(document.getElementById('source').value, document.getElementById('target').value);
+        const result = document.getElementById('result');
+        result.innerHTML = rows.map(row => {
+            const messages = [...row.issues, ...(row.warning ? ['Identical value'] : [])];
+            const status = row.issues.length ? 'missing' : row.warning ? 'same' : '';
+            const location = row.sourceLine ? `Source line ${row.sourceLine}, Target line ${row.targetLine}. ` : '';
+            const label = location + messages.join('; ');
+            return `<span class="result-line ${status}"${status ? ' data-difference tabindex="-1"' : ''} title="${escapeHtml(label)}"${status ? ` aria-label="${escapeHtml(label + ': ' + row.text)}"` : ''}>${escapeHtml(row.text) || ' '}</span>`;
+        }).join('');
+        document.getElementById('diffCount').textContent = rows.filter(row => row.issues.length).length;
+        document.getElementById('warningCount').textContent = rows.filter(row => row.warning).length;
+        differenceElements = [...result.querySelectorAll('[data-difference]')];
+        activeDifference = -1;
+        updateNavigation();
     };
+
+    document.getElementById('previousDiff').addEventListener('click', () => navigateDifference(-1));
+    document.getElementById('nextDiff').addEventListener('click', () => navigateDifference(1));
 
     const handleTab = e => {
         if ('Tab' !== e.key) {
@@ -317,6 +442,8 @@
 
     document.getElementById('source').addEventListener('input', renderDiff);
     document.getElementById('target').addEventListener('input', renderDiff);
+
+    renderDiff();
 
     document.querySelectorAll('textarea').forEach(textarea => {
         textarea.addEventListener('keydown', handleTab);
